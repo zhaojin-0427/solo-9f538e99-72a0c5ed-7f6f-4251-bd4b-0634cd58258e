@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_instance ON reports(instance_id, created_at);
+
+-- Quarterly datasets derived from four feasible year-to-date reports.
+-- Immutable once published: sources/facts are frozen JSON, and "current" is
+-- computed at read time from the source reports' superseded flags.
+CREATE TABLE IF NOT EXISTS datasets (
+    id               TEXT PRIMARY KEY,
+    package_id       TEXT NOT NULL,
+    package_revision INTEGER NOT NULL,
+    entity           TEXT NOT NULL,
+    currency         TEXT NOT NULL,
+    year             INTEGER NOT NULL,
+    sources_json     TEXT NOT NULL,      -- 4 entries: quarter, report, instance+revision, period
+    facts_json       TEXT NOT NULL,      -- per-concept quarterly amounts / pending markers
+    detail_json      TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
 """
 
 

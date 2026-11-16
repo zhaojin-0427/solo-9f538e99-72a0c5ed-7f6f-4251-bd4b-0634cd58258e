@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse, Response
 from . import storage
 from .db import init_db
 from .errors import ApiError
-from .models import (CheckAck, InstanceOut, PackageOut, ReportList, ReportOut)
+from .models import (CheckAck, DatasetCreate, DatasetOut, InstanceOut,
+                     PackageOut, ReportList, ReportOut)
 
 
 @asynccontextmanager
@@ -26,8 +27,10 @@ app = FastAPI(
         "保存可修订的 XBRL 实例与计算关系包（XSD + calculation linkbase），"
         "按 decimals 舍入闭区间核查全部加权等式。返回同时满足全部等式的金额见证，"
         "或相互矛盾的事实/关系；缺引用事实则整份待补。"
+        "另可用四份可行的年初累计报告生成季度数据集（Q1 累计额 + Q2~Q4 相邻差额区间），"
+        "供趋势分析；来源更正后旧数据集仍可读但不再是当前结果。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -143,3 +146,22 @@ def report_snapshot(report_id: str, kind: str):
         raise BadPayload("kind must be one of instance, xsd, calc")
     data, media = storage.get_report_snapshot(report_id, kind)
     return Response(content=data, media_type=media)
+
+
+# ------------------------------------------------------------- datasets
+@app.post("/datasets", response_model=DatasetOut, status_code=201, tags=["datasets"],
+          summary="用四份可行年初累计报告生成季度数据集；来源修订变化则 412 拒绝")
+def create_dataset(payload: DatasetCreate):
+    return storage.create_dataset(payload.report_ids)
+
+
+@app.get("/datasets", response_model=list[DatasetOut], tags=["datasets"],
+         summary="全部季度数据集；current_only=true 只看当前结果")
+def list_datasets(current_only: bool = Query(False)):
+    return storage.list_datasets(current_only)
+
+
+@app.get("/datasets/{dataset_id}", response_model=DatasetOut, tags=["datasets"],
+         summary="单份季度数据集（来源更正后仍可读，current=false）")
+def get_dataset(dataset_id: str):
+    return storage.get_dataset(dataset_id)

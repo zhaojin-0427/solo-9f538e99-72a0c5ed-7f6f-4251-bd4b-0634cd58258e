@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from . import db
-from .errors import NotFound, StaleRevision
+from .errors import BadPayload, NotFound, StaleRevision
 from .instance import parse_instance
 from .solver import check_facts
 from .taxonomy import parse_package
@@ -368,3 +368,256 @@ def list_reports(iid: str) -> dict:
         (r for r in reversed(history) if not r["superseded"] and not r["late"]), None
     )
     return {"instance_id": iid, "current": current, "history": history}
+
+
+# ---------------------------------------------------------------- datasets
+QUARTERS = ("Q1", "Q2", "Q3", "Q4")
+_QUARTER_ENDS = {(3, 31): "Q1", (6, 30): "Q2", (9, 30): "Q3", (12, 31): "Q4"}
+
+
+def _ytd_quarter(period: str) -> tuple[int, str]:
+    """Map a ``duration=YYYY-01-01/YYYY-MM-DD`` year-to-date period to (year, quarter)."""
+    prefix = "duration="
+    if not period.startswith(prefix):
+        raise BadPayload(
+            f"report period '{period}' is not a Jan-1-to-quarter-end duration",
+            code="bad_period",
+        )
+    try:
+        start_s, end_s = period[len(prefix):].split("/", 1)
+        start = date.fromisoformat(start_s)
+        end = date.fromisoformat(end_s)
+    except ValueError:
+        raise BadPayload(
+            f"report period '{period}' is not a valid duration", code="bad_period"
+        )
+    quarter = _QUARTER_ENDS.get((end.month, end.day))
+    if quarter is None or (start.month, start.day) != (1, 1) or start.year != end.year:
+        raise BadPayload(
+            f"report period '{period}' must run from Jan 1 to a quarter end "
+            "of one calendar year",
+            code="bad_period",
+        )
+    return end.year, quarter
+
+
+def create_dataset(report_ids: list[str]) -> dict:
+    """Publish a quarterly dataset from four feasible year-to-date reports.
+
+    All validation happens before the single INSERT, so a rejected publish
+    leaves no partial dataset and the source reports are never rewritten.
+    """
+    if len(report_ids) != 4:
+        raise BadPayload(
+            f"exactly four report IDs are required, got {len(report_ids)}",
+            code="bad_report_set",
+        )
+    if len(set(report_ids)) != 4:
+        raise BadPayload("the four report IDs must be distinct", code="bad_report_set")
+
+    conn = db.get_conn()
+    reports: list[dict] = []
+    for rid in report_ids:
+        row = conn.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+        if row is None:
+            raise NotFound(f"report '{rid}' not found")
+        reports.append(dict(row))
+
+    not_feasible = [r["id"] for r in reports if r["status"] != "feasible"]
+    if not_feasible:
+        raise BadPayload(
+            "only feasible reports can form a quarterly dataset; not feasible: "
+            + ", ".join(not_feasible),
+            code="report_not_feasible",
+        )
+
+    details = [json.loads(r["detail_json"]) for r in reports]
+    if (len({r["package_id"] for r in reports}) != 1
+            or len({r["package_revision"] for r in reports}) != 1):
+        raise BadPayload(
+            "the four reports must share one relationship package and revision",
+            code="source_mismatch",
+        )
+    if len({d["entity"] for d in details}) != 1:
+        raise BadPayload(
+            "the four reports must share one entity", code="source_mismatch"
+        )
+    if len({d["currency"] for d in details}) != 1:
+        raise BadPayload(
+            "the four reports must share one currency", code="source_mismatch"
+        )
+
+    # 期间：同一自然年 1 月 1 日至四个季末，每季度恰好一份。
+    by_quarter: dict[str, tuple[dict, dict]] = {}
+    years: set[int] = set()
+    for r, d in zip(reports, details):
+        year, quarter = _ytd_quarter(d["period"])
+        if quarter in by_quarter:
+            raise BadPayload(
+                f"two reports cover {quarter}; submit exactly one report per quarter",
+                code="bad_period",
+            )
+        by_quarter[quarter] = (r, d)
+        years.add(year)
+    if len(years) != 1:
+        raise BadPayload(
+            "the four reports must belong to one calendar year", code="bad_period"
+        )
+    missing_q = [q for q in QUARTERS if q not in by_quarter]
+    if missing_q:
+        raise BadPayload(
+            "missing year-to-date reports for quarters: " + ", ".join(missing_q),
+            code="bad_period",
+        )
+    year = years.pop()
+    package_id = reports[0]["package_id"]
+    package_revision = reports[0]["package_revision"]
+
+    # 受理时校验：四份报告必须仍是当前报告，且生成期间两侧修订未变化。
+    for r in reports:
+        if r["superseded"] or r["late"]:
+            raise StaleRevision(
+                f"report '{r['id']}' is no longer a current report; "
+                "rebuild the dataset from current reports"
+            )
+        inst = conn.execute(
+            "SELECT latest_rev FROM instances WHERE id=?", (r["instance_id"],)
+        ).fetchone()
+        if inst is None or inst["latest_rev"] != r["instance_revision"]:
+            raise StaleRevision(
+                f"instance '{r['instance_id']}' changed during dataset generation "
+                f"(report '{r['id']}' used revision {r['instance_revision']})"
+            )
+    pkg = conn.execute(
+        "SELECT latest_rev FROM packages WHERE id=?", (package_id,)
+    ).fetchone()
+    if pkg is None or pkg["latest_rev"] != package_revision:
+        raise StaleRevision(
+            f"package '{package_id}' changed during dataset generation "
+            f"(reports used revision {package_revision})"
+        )
+
+    # 按概念生成季度事实：Q1 累计额；Q2..Q4 相邻累计差额（区间算术）。
+    witnesses: dict[str, dict[str, dict]] = {}
+    for quarter, (r, _d) in by_quarter.items():
+        witness = json.loads(r["witness_json"]) if r["witness_json"] else []
+        witnesses[quarter] = {w["concept"]: w for w in witness}
+
+    concepts = sorted({c for w in witnesses.values() for c in w})
+    facts: list[dict] = []
+    for concept in concepts:
+        missing_in = [q for q in QUARTERS if concept not in witnesses[q]]
+        if missing_in:
+            # 任一来源缺事实：整概念标待补，不补零。
+            facts.append({
+                "concept": concept,
+                "status": "pending",
+                "missing_in": missing_in,
+                "quarters": [],
+            })
+            continue
+        quarters: list[dict] = []
+        prev: dict | None = None
+        for q in QUARTERS:
+            w = witnesses[q][concept]
+            if prev is None:  # Q1：年初累计额
+                reported = w["reported_value"]
+                true = w["true_value"]
+                lower, upper = w["lower"], w["upper"]
+            else:  # Q2..Q4：本期减上期的相邻累计差额
+                reported = w["reported_value"] - prev["reported_value"]
+                true = w["true_value"] - prev["true_value"]
+                lower = w["lower"] - prev["upper"]
+                upper = w["upper"] - prev["lower"]
+            quarters.append({
+                "quarter": q,
+                "reported_value": round(reported, 10),
+                "true_value": round(true, 10),
+                "lower": round(lower, 10),
+                "upper": round(upper, 10),
+            })
+            prev = w
+        facts.append({"concept": concept, "status": "ok", "quarters": quarters})
+
+    sources = [
+        {
+            "quarter": q,
+            "report_id": by_quarter[q][0]["id"],
+            "instance_id": by_quarter[q][0]["instance_id"],
+            "instance_revision": by_quarter[q][0]["instance_revision"],
+            "period": by_quarter[q][1]["period"],
+        }
+        for q in QUARTERS
+    ]
+    detail = {
+        "entity": details[0]["entity"],
+        "currency": details[0]["currency"],
+        "year": year,
+        "package_id": package_id,
+        "package_revision": package_revision,
+        "concept_count": len(facts),
+        "pending_concept_count": sum(1 for f in facts if f["status"] == "pending"),
+        "rule": (
+            "Q1 = year-to-date cumulative amount; Q2..Q4 = adjacent YTD "
+            "difference with lower=current.lower-previous.upper and "
+            "upper=current.upper-previous.lower; concepts missing from any "
+            "source are marked pending, never zero-filled"
+        ),
+    }
+    dataset_id = _new_id("ds")
+    now = _now()
+    with conn:
+        conn.execute(
+            "INSERT INTO datasets(id, package_id, package_revision, entity, currency, "
+            "year, sources_json, facts_json, detail_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (dataset_id, package_id, package_revision, details[0]["entity"],
+             details[0]["currency"], year, json.dumps(sources), json.dumps(facts),
+             json.dumps(detail), now),
+        )
+    return get_dataset(dataset_id)
+
+
+def _dataset_out(conn, row: dict) -> dict:
+    sources = json.loads(row["sources_json"])
+    # 当前结果 ⟺ 四份来源报告都未被取代；来源更正后历史仍可读但不再是当前结果。
+    current = True
+    for s in sources:
+        r = conn.execute(
+            "SELECT superseded, late FROM reports WHERE id=?", (s["report_id"],)
+        ).fetchone()
+        if r is None or r["superseded"] or r["late"]:
+            current = False
+            break
+    return {
+        "dataset_id": row["id"],
+        "package_id": row["package_id"],
+        "package_revision": row["package_revision"],
+        "entity": row["entity"],
+        "currency": row["currency"],
+        "year": row["year"],
+        "current": current,
+        "sources": sources,
+        "facts": json.loads(row["facts_json"]),
+        "detail": json.loads(row["detail_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+def get_dataset(dataset_id: str) -> dict:
+    conn = db.get_conn()
+    row = conn.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"dataset '{dataset_id}' not found")
+    return _dataset_out(conn, dict(row))
+
+
+def list_datasets(current_only: bool = False) -> list[dict]:
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM datasets ORDER BY created_at, rowid"
+    ).fetchall()
+    out = [_dataset_out(conn, dict(r)) for r in rows]
+    if current_only:
+        out = [d for d in out if d["current"]]
+    return out

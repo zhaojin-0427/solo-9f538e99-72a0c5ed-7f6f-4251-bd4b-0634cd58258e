@@ -1,7 +1,8 @@
 # XBRL 财报勾稽核查 API（FastAPI + SQLite）
 
 财报入仓员用它判断一份 XBRL 实例与计算关系包之间的勾稽差额，**是否只是
-`decimals` 舍入造成的**，从而决定受理或退回重报。
+`decimals` 舍入造成的**，从而决定受理或退回重报；财报数据员再把四份已核查的
+年初累计报告汇总成 **季度数据集**，供趋势分析。
 
 ## 核查语义
 
@@ -16,6 +17,30 @@
   - `infeasible`：无解，返回一组或多组 **相互矛盾的事实与等式**（最小不可行分组，
     含每条等式在中点见证下的残差）。
   - `pending`：任一等式引用了实例中不存在的事实，列出缺失概念，**整份待补**。
+
+## 季度数据集
+
+`POST /datasets` 提交 **四个可行（feasible）报告 ID**（顺序不限），服务器校验后
+生成一份季度数据集：
+
+- 四份报告必须对应 **同一实体、同一币种、同一关系包及其修订**，期间分别为
+  **同一自然年 1 月 1 日至四个季末**（`03-31 / 06-30 / 09-30 / 12-31`），
+  每季度恰好一份；不满足返回 `422`（`source_mismatch` / `bad_period` /
+  `report_not_feasible` / `bad_report_set`）。
+- 按概念生成季度事实：
+  - **Q1 = 年初累计额**（沿用该报告的舍入区间）；
+  - **Q2～Q4 = 相邻累计差额**：下界 = 本期下界 − 上期上界，
+    上界 = 本期上界 − 上期下界；点值同时给出报告值口径（`reported_value`）
+    与见证真值口径（`true_value`）。
+  - **任一来源缺事实的概念整概念标 `pending`（待补），不补零**，
+    并用 `missing_in` 列出缺事实的季度。
+- 数据集随存四份来源报告、所用实例及修订、关系包修订（`sources`），
+  计算结果冻结在 `facts` 中。
+- **生成期间任一实例或关系包修订变化则拒绝发布**（`412 stale_revision`；
+  已被取代/迟到的报告同样拒绝）；校验全部在写入前完成且仅一条 INSERT，
+  **失败不留半份数据集，原报告不改写**。
+- **来源更正后历史可读，但不再是当前结果**：`current` 在读取时按四份来源报告
+  是否仍未被取代计算；`GET /datasets?current_only=true` 只看当前结果。
 
 ## 修订与并发（乐观锁）
 
@@ -39,7 +64,8 @@ docker compose up --build
 # 文档:  http://localhost:8000/docs   （可直接在 Swagger UI 更正、核查、读取报告）
 ```
 
-首启会自动注入演示关系包与 4 个场景实例（feasible / rounding / infeasible / pending）。
+首启会自动注入演示关系包与 4 个场景实例（feasible / rounding / infeasible /
+pending），并生成 4 份可行的年初累计报告与 1 份季度数据集。
 设置 `XRECON_SEED_SAMPLES=0` 可关闭。
 
 ## 主要接口
@@ -56,6 +82,8 @@ docker compose up --build
 | GET | `/instances/{id}/reports` | 当前报告 + 全部历史（含过期、迟到） |
 | GET | `/reports/{id}` | 单份报告 |
 | GET | `/reports/{id}/snapshots/{kind}` | 下载报告保存的原始依据 |
+| POST | `/datasets` | 用四份可行年初累计报告生成季度数据集（JSON：`report_ids`） |
+| GET | `/datasets`、`/datasets/{id}` | 数据集列表/详情（`?current_only=true` 只看当前结果） |
 
 ## 本地开发与自测
 
@@ -68,7 +96,7 @@ uv venv .venv && uv pip install -r requirements.txt pytest httpx -p .venv
 
 ```
 app/            FastAPI 应用、解析器、求解器、SQLite 持久化
-tests/          28 个端到端/单元测试 + 样本 XBRL
+tests/          39 个端到端/单元测试 + 样本 XBRL
 scripts/        容器首启演示数据播种
 Dockerfile, docker-compose.yml
 ```

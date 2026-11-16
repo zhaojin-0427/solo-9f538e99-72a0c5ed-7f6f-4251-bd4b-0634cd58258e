@@ -114,3 +114,47 @@ class ReportList(BaseModel):
     instance_id: str
     current: Optional[ReportOut] = None
     history: list[ReportOut]
+
+
+# ---------------------------------------------------------------- datasets
+class DatasetCreate(BaseModel):
+    """Four feasible year-to-date report IDs (any order; quarters are inferred
+    from each report's period)."""
+    report_ids: list[str]
+
+
+class DatasetSource(BaseModel):
+    quarter: str                 # Q1..Q4
+    report_id: str
+    instance_id: str
+    instance_revision: int
+    period: str
+
+
+class QuarterlyFact(BaseModel):
+    quarter: str                 # Q1..Q4
+    reported_value: float        # Q1 cumulative / Q2..Q4 adjacent difference, as reported
+    true_value: float            # same, on the witness true values
+    lower: float                 # Q1: YTD interval; Q2..Q4: cur.lower - prev.upper
+    upper: float                 # Q1: YTD interval; Q2..Q4: cur.upper - prev.lower
+
+
+class DatasetConcept(BaseModel):
+    concept: str
+    status: Literal["ok", "pending"]   # pending = some source lacks the fact (never zero-filled)
+    quarters: list[QuarterlyFact] = Field(default_factory=list)
+    missing_in: list[str] = Field(default_factory=list)  # quarters lacking the fact
+
+
+class DatasetOut(BaseModel):
+    dataset_id: str
+    package_id: str
+    package_revision: int
+    entity: str
+    currency: str
+    year: int
+    current: bool                # False once any source report was superseded
+    sources: list[DatasetSource]
+    facts: list[DatasetConcept]
+    detail: dict
+    created_at: str
